@@ -1458,8 +1458,8 @@ const AU={ctx:null,master:null,bus:{},fac:null,birds:null,
 /* ===================== CLOCK ===================== */
 const SIM_RATE=192; // 1× = 192× real time → one sim day every 7.5 real minutes
 function simHour(){return (typeof G!=='undefined'&&G&&typeof G.hourF==='number')?G.hourF:8;}
-function setSpeed(s,silent){SPEED=s;document.querySelectorAll('.speed button').forEach(b=>b.classList.toggle('on',+b.dataset.s===s));clearInterval(timer);timer=null;
- if(s>0){const per=100;let last=performance.now();timer=setInterval(()=>{if(G.flags.over)return;const now=performance.now();const real=Math.min(1,(now-last)/1000);last=now;if(typeof G.hourF!=='number')G.hourF=8;G.hourF+=real*SIM_RATE*s/3600;let n=0;while(G.hourF>=24&&n<64){G.hourF-=24;n++;tick(G);if(opt('autosave')&&G.day%opt('autosave')===0)autosave();}if(n)render();else hudClock();},per);}
+function setSpeed(s,silent){SPEED=s;document.querySelectorAll('.speed button').forEach(b=>b.classList.toggle('on',+b.dataset.s===s));(window.wClearInterval||clearInterval)(timer);timer=null;
+ if(s>0){const per=100;let last=performance.now();timer=(window.wInterval||setInterval)(()=>{if(G.flags.over)return;const now=performance.now();const real=Math.min(1,(now-last)/1000);last=now;if(typeof G.hourF!=='number')G.hourF=8;G.hourF+=real*SIM_RATE*s/3600;let n=0;while(G.hourF>=24&&n<64){G.hourF-=24;n++;tick(G);if(opt('autosave')&&G.day%opt('autosave')===0)autosave();}if(n)render();else hudClock();},per);}
  function hudClock(){const e=document.getElementById('dateLbl');if(!e||typeof G==='undefined')return;const sm=e.querySelector('small');if(!sm)return;const h=simHour();const txt=String(Math.floor(h)).padStart(2,'0')+':'+String(Math.floor((h%1)*60)).padStart(2,'0');const t=sm.textContent;const i=t.indexOf(' · ');if(i>0&&/^\d\d:\d\d$/.test(t.slice(0,5)))sm.textContent=txt+t.slice(5);}
  if(!silent)AU.cue('click');AU.factory(s>0&&cur==='plant');}
 function stopClock(){setSpeed(0,true);}function skipMonth(){const m=G.date.getMonth();let n=0;while(G.date.getMonth()===m&&n++<40&&!G.flags.over)tick(G);render(1);}function onMonth(){AU.cue('month');}
@@ -2782,131 +2782,257 @@ Object.assign(window.I18N_EXTRA,SIT_AR,{"Milk premium accepted": "قبول عل�
 if(typeof I18N!=='undefined'&&I18N.dict){Object.assign(I18N.dict,window.I18N_EXTRA);}
 </script>
 <script>
-/* ===================== ONLINE PLAY (Supabase) =====================
-   One browser hosts the simulation (runs the clock). Other players join a room code, pick a department,
-   see the same live state, act on their own desk (actions are sent to the host and executed there),
-   watch a live feed of everyone's actions, and chat by department. */
-const NT_BUILD='v32 · 2026-11-06 06:55';const SB_URL='https://ixtnfaffecqpvknxnhok.supabase.co';let SB_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml4dG5mYWZmZWNxcHZrbnhuaG9rIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTM5MDc5MjUsImV4cCI6MjEwOTQ4MzkyNX0.FbX4o3CF1ONHQmXuMBSONxxJoRymrwhl0zcZuq1q79Y';try{localStorage.removeItem('nileSbKey');}catch(e){}
-const ONLINE={rx:{state:0,action:0,chat:0,presence:0,need:0},tx:{state:0,action:0,chat:0},log:[],
- on:false,host:false,sb:null,ch:null,room:null,me:null,players:{},feed:[],chat:[],unread:0,lastSync:0,dirty:false,_chunks:{},status:'offline',
+/* ===================== ONLINE PLAY v40 (rebuilt) =====================
+   Architecture
+   - Transport: RT — a self-contained Supabase Realtime client (Phoenix protocol v1 over one WebSocket).
+     Heartbeat every 15 s from a Web Worker (not throttled in background tabs); an unanswered heartbeat
+     or join forces a reconnect; exponential back-off; channels re-join and presence re-tracks automatically.
+   - Host: runs the clock. Streams the company as numbered messages: a FULL snapshot (on join, on request,
+     after every executed action, every 15 s) and DELTAS (only changed top-level fields, every second).
+   - Player: applies a delta only if it follows the last message it applied; on any gap it asks for a full
+     snapshot. Actions are sent with an id and re-sent until the host acknowledges (the host de-duplicates).
+   - Chat and the action feed live inside the shared company state (G.chatLog / G.netFeed), so they survive
+     reconnects and late joiners see history. Broadcast gives instant delivery; the state stream guarantees it. */
+const NT_BUILD='v40 · 2026-11-06';
+const SB_URL=window.NT_SB_URL||'https://ixtnfaffecqpvknxnhok.supabase.co';
+const SB_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml4dG5mYWZmZWNxcHZrbnhuaG9rIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTM5MDc5MjUsImV4cCI6MjEwOTQ4MzkyNX0.FbX4o3CF1ONHQmXuMBSONxxJoRymrwhl0zcZuq1q79Y';
+const NT_CFG=Object.assign({hb:15000,hbTimeout:10000,joinTimeout:10000,deltaMs:1000,fullMs:15000,chunk:24000,ackMs:3000,silentMs:8000,helloMs:10000},window.NT_TEST||{});
+try{localStorage.removeItem('nileSbKey');}catch(e){}
+
+/* ---------- background-proof timers (Web Worker) ---------- */
+(function(){let w=null,seq=0;const cbs={};try{const src='const T={};onmessage=e=>{const m=e.data;if(m.op==="set")T[m.id]=setInterval(()=>postMessage(m.id),m.ms);else if(m.op==="clear"){clearInterval(T[m.id]);delete T[m.id];}};';w=new Worker(URL.createObjectURL(new Blob([src],{type:'text/javascript'})));w.onmessage=e=>{const f=cbs[e.data];if(f)try{f();}catch(err){console.warn(err);}};}catch(e){w=null;}
+ window.wInterval=function(fn,ms){if(!w)return setInterval(fn,ms);const id='w'+(++seq);cbs[id]=fn;w.postMessage({op:'set',id,ms});return id;};
+ window.wClearInterval=function(id){if(id==null)return;if(typeof id==='string'&&id[0]==='w'&&w){delete cbs[id];w.postMessage({op:'clear',id});}else clearInterval(id);};})();
+
+/* ---------- RT: Supabase Realtime transport ---------- */
+class RT{
+ constructor(url,key,log){this.url=url.replace('https://','wss://').replace('http://','ws://')+'/realtime/v1/websocket?apikey='+encodeURIComponent(key)+'&vsn=1.0.0';this.key=key;this.log=log||(()=>{});this.refN=0;this.chans={};this.ws=null;this.state='idle';this.tries=0;this.userClosed=false;this.L={};this.rtt=null;this.reconnects=0;}
+ on(ev,f){(this.L[ev]=this.L[ev]||[]).push(f);}
+ emit(ev,a){(this.L[ev]||[]).forEach(f=>{try{f(a);}catch(e){console.warn(e);}});}
+ ref(){return String(++this.refN);}
+ open(){this.userClosed=false;if(this.ws&&(this.ws.readyState===0||this.ws.readyState===1))return this.ready;clearTimeout(this.rtT);this.state='connecting';this.emit('state','connecting');let ws;
+  this.ready=new Promise((res,rej)=>{try{ws=new WebSocket(this.url);}catch(e){this.state='closed';rej(e);this.retry();return;}this.ws=ws;
+   const to=setTimeout(()=>{if(this.ws===ws&&ws.readyState!==1){this.log('connect timeout');this.drop(ws,'connect timeout');}},10000);
+   ws.onopen=()=>{if(this.ws!==ws)return;clearTimeout(to);this.state='open';this.tries=0;this.log('socket open');this.startHb();Object.values(this.chans).forEach(c=>{if(c.want)this.join(c);});this.emit('state','open');res();};
+   ws.onmessage=e=>{if(this.ws!==ws)return;let m;try{m=JSON.parse(e.data);}catch(_){return;}this.recv(m);};
+   ws.onerror=()=>{};
+   ws.onclose=e=>{clearTimeout(to);if(this.ws!==ws)return;this.log('socket closed '+e.code+(e.reason?' '+e.reason:''));this.lost();rej(new Error('closed '+e.code));};});
+  this.ready.catch(()=>{});return this.ready;}
+ // the socket is gone (closed, timed out or half-dead): mark channels, schedule reconnect
+ lost(){this.stopHb();this.ws=null;this.state='closed';Object.values(this.chans).forEach(c=>{c.joined=false;clearTimeout(c.joinT);c.joinPending=null;});this.emit('state','closed');if(!this.userClosed)this.retry();}
+ drop(ws,why){this.log('dropping socket: '+why);this.ws=null;try{ws&&ws.close();}catch(e){}this.lost();}
+ retry(){clearTimeout(this.rtT);const d=[300,1000,2000,4000,8000][Math.min(this.tries++,4)];this.reconnects++;this.state='reconnecting';this.emit('state','reconnecting');this.rtT=setTimeout(()=>{if(!this.userClosed)this.open();},d);}
+ nudge(){if(!this.userClosed&&this.state!=='open'&&this.state!=='connecting'){clearTimeout(this.rtT);this.tries=0;this.open();}}
+ close(){this.userClosed=true;clearTimeout(this.rtT);this.stopHb();const ws=this.ws;this.ws=null;this.state='idle';try{ws&&ws.close(1000);}catch(e){}}
+ startHb(){this.stopHb();this.hbPending=null;this.hbLast=Date.now();this.hbT=wInterval(()=>{const ws=this.ws;if(!ws||ws.readyState!==1)return;const now=Date.now();
+   if(this.hbPending&&now-this.hbPending.t>NT_CFG.hbTimeout){this.drop(ws,'heartbeat not answered in '+NT_CFG.hbTimeout+' ms');return;}
+   if(!this.hbPending&&now-this.hbLast>=NT_CFG.hb){const r=this.ref();this.hbPending={ref:r,t:now};this.hbLast=now;this.raw({topic:'phoenix',event:'heartbeat',payload:{},ref:r});}},Math.max(500,Math.min(5000,Math.floor(NT_CFG.hb/3))));}
+ stopHb(){wClearInterval(this.hbT);this.hbT=null;this.hbPending=null;}
+ raw(m){const ws=this.ws;if(!ws||ws.readyState!==1)return false;try{ws.send(JSON.stringify(m));return true;}catch(e){return false;}}
+ channel(name,key){const topic='realtime:'+name;return this.chans[topic]||(this.chans[topic]={topic,key,h:{},pres:{},joined:false,want:false,ref:null,trackSt:null});}
+ handle(c,ev,f){(c.h[ev]=c.h[ev]||[]).push(f);}
+ subscribe(c,cb){c.want=true;c.cb=cb;if(this.state==='open')this.join(c);else this.open();}
+ join(c){const r=this.ref();c.ref=r;c.joinPending=r;c.pres={};clearTimeout(c.joinT);
+  this.raw({topic:c.topic,event:'phx_join',payload:{config:{broadcast:{self:false,ack:false},presence:{key:c.key||'',enabled:true},postgres_changes:[],private:false},access_token:this.key},ref:r,join_ref:r});
+  c.joinT=setTimeout(()=>{if(c.joinPending===r&&this.ws)this.drop(this.ws,'join not answered');},NT_CFG.joinTimeout);}
+ send(c,ev,payload){if(!c.joined)return false;return this.raw({topic:c.topic,event:'broadcast',payload:{type:'broadcast',event:ev,payload},ref:this.ref(),join_ref:c.ref});}
+ track(c,st){c.trackSt=st;if(c.joined)this.raw({topic:c.topic,event:'presence',payload:{type:'presence',event:'track',payload:st},ref:this.ref(),join_ref:c.ref});}
+ leave(c){c.want=false;if(c.joined)this.raw({topic:c.topic,event:'phx_leave',payload:{},ref:this.ref(),join_ref:c.ref});c.joined=false;clearTimeout(c.joinT);delete this.chans[c.topic];}
+ recv(m){
+  if(m.topic==='phoenix'){if(m.event==='phx_reply'&&this.hbPending&&m.ref===this.hbPending.ref){this.rtt=Date.now()-this.hbPending.t;this.hbPending=null;}return;}
+  const c=this.chans[m.topic];if(!c)return;
+  if(m.event==='phx_reply'){if(m.ref===c.joinPending){clearTimeout(c.joinT);c.joinPending=null;if(m.payload&&m.payload.status==='ok'){c.joined=true;this.log('joined '+c.topic);if(c.trackSt)this.track(c,c.trackSt);c.cb&&c.cb('joined');}else{this.log('join refused '+JSON.stringify(m.payload).slice(0,200));c.cb&&c.cb('refused',m.payload);setTimeout(()=>{if(c.want&&this.state==='open'&&!c.joined)this.join(c);},3000);}}
+   else if(m.payload&&m.payload.status&&m.payload.status!=='ok')this.log('server error '+JSON.stringify(m.payload).slice(0,200));return;}
+  if(m.event==='phx_error'||m.event==='phx_close'){this.log(m.event+' '+JSON.stringify(m.payload||{}).slice(0,120));c.joined=false;c.cb&&c.cb('lost');if(c.want)setTimeout(()=>{if(c.want&&this.state==='open'&&!c.joined&&!c.joinPending)this.join(c);},1000);return;}
+  if(m.event==='system'){this.log('system '+JSON.stringify(m.payload||{}).slice(0,200));return;}
+  if(m.event==='broadcast'){const p=m.payload||{};(c.h[p.event]||[]).forEach(f=>{try{f(p.payload);}catch(e){console.warn(e);}});return;}
+  if(m.event==='presence_state'){c.pres={};for(const k in m.payload)c.pres[k]=(m.payload[k].metas||[]).slice();(c.h.__presence||[]).forEach(f=>f(c.pres));return;}
+  if(m.event==='presence_diff'){const j=m.payload.joins||{},l=m.payload.leaves||{};for(const k in l){const refs=(l[k].metas||[]).map(x=>x.phx_ref);c.pres[k]=(c.pres[k]||[]).filter(x=>!refs.includes(x.phx_ref));if(!c.pres[k].length)delete c.pres[k];}for(const k in j)c.pres[k]=(c.pres[k]||[]).concat(j[k].metas||[]);(c.h.__presence||[]).forEach(f=>f(c.pres));}}
+}
+
+/* ---------- session layer ---------- */
+const ONLINE={on:false,isHost:false,room:null,me:null,rt:null,ch:null,status:'offline',phase:'offline',
+ seen:{},pres:{},localChat:[],log:[],rx:{st:0,full:0,delta:0,gap:0,act:0,ack:0,chat:0,need:0},tx:{st:0,full:0,delta:0,act:0,chat:0},
+ seq:0,lastSeq:-1,lastStateAt:0,chunks:{},pend:{},done:[],drawerTab:'players',unread:0,_sent:null,
+ dbg(m){this.log.unshift(new Date().toLocaleTimeString()+' '+m);if(this.log.length>80)this.log.pop();},
  cfg(){try{return JSON.parse(localStorage.getItem('nileOnline')||'{}');}catch(e){return {};}},
  saveCfg(c){try{localStorage.setItem('nileOnline',JSON.stringify(Object.assign(this.cfg(),c)));}catch(e){}},
- // ---------- libraries (loaded only when going online) ----------
- lib(){return new Promise((res,rej)=>{let n=0;const need=[['supabase','https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.118.0/dist/umd/supabase.js'],['LZString','https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js']].filter(([g])=>!window[g]);if(!need.length)return res();need.forEach(([g,src])=>{const s=document.createElement('script');s.src=src;s.onload=()=>{if(++n===need.length)res();};s.onerror=()=>rej(new Error('Could not load '+g+' (network blocked?)'));document.head.appendChild(s);});});},
+ lib(){if(window.LZString)return Promise.resolve();return new Promise((res,rej)=>{const s=document.createElement('script');s.src='https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js';s.onload=()=>res();s.onerror=()=>rej(new Error('could not load lz-string from cdnjs'));document.head.appendChild(s);});},
  code(){const A='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';let c='';for(let i=0;i<6;i++)c+=A[Math.floor(Math.random()*A.length)];return c;},
- setStatus(s){this.status=s;const e=document.getElementById('olStatus');if(e)e.textContent=s;const b=document.getElementById('bOnline');if(b){b.classList.toggle('on',this.on);b.title=s;}},
- // ---------- connect ----------
- async connect(){await this.lib();if(!this.sb)this.sb=window.supabase.createClient(SB_URL,SB_KEY,{realtime:{params:{eventsPerSecond:20}}});},
- async host(name,code){try{await this.connect();code=(code||'').trim().toUpperCase()||this.code();this.room=code;this.host=true;this.me={id:'p'+Math.random().toString(36).slice(2,8),name:name||'Host',role:G.role||'admin'};
-  await this.join_channel();this.on=true;this.setStatus('Hosting room '+code);this.saveCfg({name,room:code});toast('good','Room open','Share code '+code+' — players join from Options → Online play.');this.feedAdd({who:this.me.name,role:this.me.role,label:'opened the room',t:Date.now()});
-  this.syncTimer=setInterval(()=>this.syncState(false),1500);this.dbTimer=setInterval(()=>this.persist(),30000);render(1);}catch(e){toast('bad','Could not host',String(e.message||e));}},
- async join(code,name){try{await this.connect();code=(code||'').trim().toUpperCase();if(!code)throw new Error('Enter the room code the host shared');
-  this.room=code;this.host=false;this.me={id:'p'+Math.random().toString(36).slice(2,8),name:name||'Player',role:G&&G.role||'proc'};
-  await this.join_channel();this.on=true;this.setStatus('Joined room '+code+' · waiting for the host…');this.saveCfg({name,room:code});setSpeed(0,true);
-  // ask the host for the state; retry a few times, give up after ~12 s
-  this._gotState=false;let tries=0;const ask=()=>{if(this._gotState||!this.on)return;if(++tries>6){toast('bad','No host found','Nobody is hosting room '+code+' right now. Check the code or ask the host to open the room.');this.leave();return;}this.bc('need_state',{from:this.me.id});setTimeout(ask,2000);};setTimeout(ask,600);render(1);}catch(e){toast('bad','Could not join',String(e.message||e));}},
- dbg(m){this.log.unshift(new Date().toLocaleTimeString()+' '+m);if(this.log.length>60)this.log.pop();console.log('[online]',m);},
- async join_channel(){const ch=this.sb.channel('room:'+this.room,{config:{presence:{key:this.me.id},broadcast:{self:false,ack:false},private:false}});this.ch=ch;
-  ch.on('system',{},p=>{this.dbg('system '+JSON.stringify(p).slice(0,140));});
-  ch.on('presence',{event:'sync'},()=>{this.rx.presence++;const st=ch.presenceState();this.players={};Object.values(st).forEach(arr=>arr.forEach(p=>{this.players[p.id]=p;}));this.renderDrawer();});
-  ch.on('broadcast',{event:'action'},({payload})=>{this.rx.action++;this.onAction(payload);});
-  ch.on('broadcast',{event:'chat'},({payload})=>{this.rx.chat++;this.dbg('chat from '+payload.who);this.onChat(payload);});
-  ch.on('broadcast',{event:'state'},({payload})=>{this.rx.state++;if(this.host)return;this.onStateChunk(payload);});
-  ch.on('broadcast',{event:'need_state'},({payload})=>{this.rx.need++;this.dbg('state requested by '+(payload&&payload.from));if(this.host)this.syncState(true);});
-  ch.on('broadcast',{event:'host_left'},()=>{if(!this.host){toast('warn','Host left','The simulation is paused until the host returns.');this.setStatus('Host offline');}});
-  await new Promise((res,rej)=>{let done=false;const to=setTimeout(()=>{if(!done){done=true;rej(new Error('Realtime connection timed out (check internet / firewall)'));}},12000);
-   ch.subscribe(async(st,err)=>{this.chState=st;const d=document.getElementById('olConn');if(d)d.textContent=st;if(st==='SUBSCRIBED'){try{await ch.track(this.track());}catch(e){}if(!done){done=true;clearTimeout(to);res();}}else if(st==='CHANNEL_ERROR'||st==='TIMED_OUT'){console.warn('realtime',st,err);if(!done){done=true;clearTimeout(to);rej(new Error('Realtime '+st+(err&&err.message?': '+err.message:'')));}else{this.setStatus('Connection lost ('+st+') — reconnecting…');}}else if(st==='CLOSED'&&done){this.setStatus('Connection closed');}});});window.addEventListener('beforeunload',()=>{if(this.host)this.bc('host_left',{});});
-  this.presTimer=setInterval(()=>{if(this.ch)this.ch.track(this.track());},5000);},
- async bc(event,payload){if(!this.ch)return 'no-channel';try{const r=await this.ch.send({type:'broadcast',event,payload});if(r!=='ok')this.dbg('send '+event+' → '+r);if(event==='state')this.tx.state++;else if(event==='action')this.tx.action++;else if(event==='chat')this.tx.chat++;return r;}catch(e){this.dbg('send '+event+' failed: '+e.message);return 'error';}},
- track(){return {id:this.me.id,name:this.me.name,role:G&&G.role||this.me.role,host:this.host,page:typeof cur!=='undefined'?cur:'',sel:(typeof V3!=='undefined'&&V3.sel&&V3.sel.name)||'',at:Date.now()};},
- leave(){try{if(this.ch){if(this.host)this.bc('host_left',{});this.sb.removeChannel(this.ch);}}catch(e){}clearInterval(this.syncTimer);clearInterval(this.dbTimer);clearInterval(this.presTimer);clearInterval(this._cc);this._cc=null;this._chunks={};this._gotState=false;this._sent=null;this.on=false;this.host=false;this.ch=null;this.room=null;this.setStatus('offline');render(1);},
- // ---------- state sync (host → players) ----------
- // every top-level piece of company state is serialised separately so only what changed is streamed
- serKeys(){const out={};for(const k in G){if(k==='opt'||k==='role')continue;out[k]=JSON.stringify(G[k],(kk,v)=>v instanceof Date?v.toISOString():v);}return out;},
- pack(){const all=this.serKeys();this._sent=all;const s=JSON.stringify(all);return window.LZString?LZString.compressToBase64(s):s;},
- packDelta(){const all=this.serKeys();const d={};let n=0;for(const k in all){if(!this._sent||this._sent[k]!==all[k]){d[k]=all[k];n++;}}for(const k in (this._sent||{}))if(!(k in all)){d[k]=null;n++;}this._sent=all;if(!n)return null;const s=JSON.stringify(d);return window.LZString?LZString.compressToBase64(s):s;},
- unpack(p){const s=(window.LZString&&!p.startsWith('{'))?LZString.decompressFromBase64(p):p;return JSON.parse(s);},
- revive(o){const re=/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$/;const walk=x=>{if(Array.isArray(x)){x.forEach((v,i)=>{if(typeof v==='string'&&re.test(v))x[i]=new Date(v);else if(v&&typeof v==='object')walk(v);});}else if(x&&typeof x==='object'){for(const k in x){const v=x[k];if(typeof v==='string'&&re.test(v))x[k]=new Date(v);else if(v&&typeof v==='object')walk(v);}}};if(typeof o==='string'&&re.test(o))return new Date(o);walk(o);return o;},
- syncState(force){if(!this.host||!this.ch)return;const now=Date.now();if(!force&&now-this.lastSync<1500)return;this.lastSync=now;const full=force||!this._sent||now-(this._lastFull||0)>20000;let p;if(full){p=this.pack();this._lastFull=now;}else{p=this.packDelta();if(!p)return;}const CH=60000;const n=Math.ceil(p.length/CH);const id=now.toString(36)+(full?'F':'D');for(let i=0;i<n;i++)this.bc('state',{id,i,n,kind:full?'full':'delta',speed:SPEED,day:G.day,h:G.hourF,s:p.slice(i*CH,(i+1)*CH)});},
- onStateChunk(pl){const c=this._chunks[pl.id]=this._chunks[pl.id]||{parts:[],n:pl.n,kind:pl.kind,speed:pl.speed};c.parts[pl.i]=pl.s;if(c.parts.filter(Boolean).length<c.n)return;delete this._chunks[pl.id];const full=c.parts.join('');const keepRole=G&&G.role,keepOpt=G&&G.opt;if(c.kind==='delta'&&!this._gotState)return;/* wait for a full snapshot first */const first=!this._gotState;this._gotState=true;this.apply(full,keepRole,keepOpt,c.kind==='delta');this.hostSpeed=c.speed||0;this.clientClock();if(first){this.setStatus('Joined room '+this.room);toast('good','Connected to '+G.name,'The host runs the clock; you act on your own desk.');}},
- // players advance the time-of-day display at the host's speed between updates (days only change on host data)
- clientClock(){if(this._cc)return;this._cc=setInterval(()=>{if(!this.on||this.host||!G)return;const sp=this.hostSpeed||0;if(sp>0&&typeof G.hourF==='number'){G.hourF=Math.min(23.98,G.hourF+0.25*192*sp/3600);if(typeof hudClock==='function')hudClock();}},250);},
- apply(packed,keepRole,keepOpt,delta){try{const raw=this.unpack(packed);let o;if(delta){o=G;for(const k in raw){if(raw[k]===null)delete o[k];else o[k]=this.revive(JSON.parse(raw[k]));}}else{o={};for(const k in raw)o[k]=this.revive(JSON.parse(raw[k]));}const sig=g=>g?[g.day,(g.lines||[]).length,(g.campus||[]).length,(g.net||[]).length,g.hqFloors,g.plantOn,JSON.stringify(g.sitesCampus||{}).length].join('|'):'';const before=this._sig||'';G=o;const after=sig(G);const changed=before!==after;this._sig=after;G.role=keepRole||G.role;G.opt=keepOpt||G.opt;if(typeof ensureOpt==='function')ensureOpt();if(typeof restoreCustomSites==='function')restoreCustomSites(G);if(typeof registerCustom==='function')registerCustom(G);if(typeof ensureRegions==='function')ensureRegions(G);if(typeof hqLayout==='function')hqLayout(G);if(typeof RB!=='undefined')RB.applyHud();if(changed&&typeof V3!=='undefined')V3.dirty=true;render(1);}catch(e){console.warn('state apply failed',e);}},
- persist(){if(!this.host)return;try{localStorage.setItem('nileRoomState',JSON.stringify(this.serKeys()));}catch(e){}},
- // ---------- actions (players → host) ----------
- SAFE:/\b(fetch|XMLHttpRequest|import|eval|Function|localStorage|sessionStorage|indexedDB|window|location|cookie|supabase|ONLINE|WebSocket|Worker|script|innerHTML|outerHTML|srcdoc)\b/i,
- MUTATING:/ACT\.|\bG\.|runJobNow|approve\(|convert|dropReq|setPlant|hire\(|placePO|skipMonth|moveDept|startDevelopment|designSku|addMaterial|resolveSituation|registerCustom|renameSite|customSite/,
- capture(e){if(!this.on)return;const el=e.target&&e.target.closest&&e.target.closest('[onclick],[onchange],[oninput]');if(!el)return;if(!el.closest('#work,#v3insp,#modal,#v3bot,#v3top,#hud'))return;const attr=e.type==='click'?'onclick':(el.getAttribute('onchange')?'onchange':'oninput');let code=el.getAttribute(attr)||'';if(!code||!this.MUTATING.test(code))return;
-  const stub={value:el.value,checked:el.checked,dataset:Object.assign({},el.dataset),textContent:el.textContent};code=code.replace(/\bthis\.value\b/g,JSON.stringify(el.value)).replace(/\bthis\.checked\b/g,String(!!el.checked));if(/\bthis\b/.test(code))code='(function(){'+code+'}).call('+JSON.stringify(stub)+')';
-  const label=(el.tagName==='BUTTON'?el.textContent.trim():(el.previousElementSibling&&el.previousElementSibling.textContent||el.name||attr)).slice(0,60);const act={id:Date.now().toString(36)+Math.random().toString(36).slice(2,5),who:this.me.name,pid:this.me.id,role:G.role,page:cur,label,code,t:Date.now()};
-  if(this.host){this.feedAdd(act);this.bc('action',Object.assign({exec:false},act));return;}
-  // player: stop the local handler, run optimistically, send to host
-  e.stopImmediatePropagation();e.preventDefault();try{(new Function(code))();}catch(err){}this.feedAdd(act);this.bc('action',Object.assign({exec:true},act));setTimeout(()=>render(1),50);},
- onAction(a){this.feedAdd(a);if(!this.host||!a.exec)return;if(this.SAFE.test(a.code)){this.feedAdd({who:'host',role:'admin',label:'rejected unsafe action from '+a.who,t:Date.now()});return;}
-  const r=ROLES.find(x=>x.id===a.role);const okPage=a.role==='admin'||!a.page||a.page==='plant'||a.page==='workflow'||a.page==='situations'||(r&&((r.pages||[]).includes(a.page)||['options','help','news'].includes(a.page)));if(!okPage){this.feedAdd({who:'host',role:'admin',label:'blocked: '+a.who+' ('+a.role+') tried to act on '+a.page,t:Date.now()});return;}
-  try{(new Function(a.code))();}catch(err){console.warn('remote action failed',err);}this.dirty=true;this.lastSync=0;setTimeout(()=>this.syncState(true),400);render(1);},
- feedAdd(a){this.feed.unshift(a);if(this.feed.length>120)this.feed.pop();this.renderDrawer();if(a.pid!==this.me.id&&this.drawerTab!=='feed')this.bump();},
+ // ---------- status shown everywhere ----------
+ setPhase(p,text){this.phase=p;this.status=text||this.status;const b=document.getElementById('bOnline');if(b){b.dataset.phase=p;b.title=this.status;}const s=document.getElementById('olStatus');if(s){s.textContent=this.status;s.className='pill '+({live:'good',connecting:'warn',reconnecting:'warn',waiting:'warn',offline:'',error:'bad'}[p]||'');}this.renderDrawer();},
+ // ---------- start / stop ----------
+ async start(asHost,code,name){if(this.on)this.leave(true);await this.lib();
+  this.isHost=asHost;this.room=code;this.me={id:'p'+Math.random().toString(36).slice(2,9),name:name||(asHost?'Host':'Player'),role:(typeof G!=='undefined'&&G&&G.role)||(asHost?'admin':'proc')};
+  this.seq=0;this.lastSeq=-1;this.lastStateAt=0;this.chunks={};this.pend={};this.done=[];this._sent=null;this.seen={};this.pres={};this.localChat=[];this.rx={st:0,full:0,delta:0,gap:0,act:0,ack:0,chat:0,need:0};this.tx={st:0,full:0,delta:0,act:0,chat:0};
+  const rt=this.rt=new RT(SB_URL,SB_KEY,m=>this.dbg(m));const ch=this.ch=rt.channel('room:'+code,this.me.id);
+  rt.on('state',s=>{if(!this.on)return;if(s==='open')return;if(s==='reconnecting'||s==='closed')this.setPhase('reconnecting','Connection interrupted — reconnecting…');});
+  rt.handle(ch,'st',p=>this.onState(p));
+  rt.handle(ch,'need',p=>{this.rx.need++;this.see(p);if(this.isHost)this.wantFull=true;});
+  rt.handle(ch,'act',p=>{this.rx.act++;this.see(p);this.onAct(p);});
+  rt.handle(ch,'ack',p=>{this.rx.ack++;this.onAck(p);});
+  rt.handle(ch,'chat',p=>{this.rx.chat++;this.see(p);this.onChat(p);});
+  rt.handle(ch,'hi',p=>{this.see(p);});
+  rt.handle(ch,'bye',p=>{if(p&&this.seen[p.pid])delete this.seen[p.pid];if(p&&p.host&&!this.isHost){this.setPhase('waiting','Host left — waiting for the host to come back…');}this.renderDrawer();});
+  rt.handle(ch,'__presence',st=>{this.pres={};Object.values(st).forEach(arr=>arr.forEach(m=>{if(m&&m.pid)this.pres[m.pid]=m;}));this.renderDrawer();});
+  this.on=true;this.setPhase('connecting',(asHost?'Opening room ':'Joining room ')+code+'…');
+  const first=new Promise((res,rej)=>{const to=setTimeout(()=>rej(new Error('Could not reach the online server in 15 s — check the internet connection.')),15000);
+   rt.subscribe(ch,(ev,info)=>{if(ev==='joined'){clearTimeout(to);res();this.onJoined();}else if(ev==='refused'){this.dbg('refused '+JSON.stringify(info));}});});
+  rt.track(ch,this.presenceInfo());
+  try{await first;}catch(e){this.leave(true);this.setPhase('error',e.message);toast('bad','Online play',e.message);throw e;}
+  this.saveCfg({name:this.me.name,room:code});
+  // timers
+  this.tickT=wInterval(()=>this.tick(),250);
+  this.helloT=wInterval(()=>{this.bc('hi',this.helloInfo());if(this.rt&&this.ch)this.rt.track(this.ch,this.presenceInfo());},NT_CFG.helloMs);
+  if(asHost){this.persistT=wInterval(()=>this.persist(),30000);toast('good','Room '+code+' is open','Players join with this code from the start screen (🌐 Join online).');}
+  else{setSpeed(0,true);toast('info','Joining '+code,'Waiting for the host’s company…');}
+  render(1);return true;},
+ host(name,code){return this.start(true,((code||'').trim().toUpperCase())||this.code(),name).catch(()=>{});},
+ join(code,name){code=(code||'').trim().toUpperCase();if(!code){toast('warn','Room code','Enter the 6-letter code the host shared.');return Promise.resolve();}return this.start(false,code,name).catch(()=>{});},
+ leave(silent){if(this.rt){try{if(this.ch&&this.ch.joined)this.rt.send(this.ch,'bye',{pid:this.me&&this.me.id,host:this.isHost});}catch(e){}try{if(this.ch)this.rt.leave(this.ch);}catch(e){}this.rt.close();}
+  [this.tickT,this.helloT,this.persistT].forEach(t=>wClearInterval(t));this.tickT=this.helloT=this.persistT=null;
+  this.rt=null;this.ch=null;this.on=false;this.isHost=false;this.room=null;this.pend={};this.chunks={};
+  document.querySelectorAll('.speed button,#bSkip').forEach(b=>b.disabled=false);
+  this.setPhase('offline','offline');if(!silent)render(1);},
+ onJoined(){// first join and every re-join after a reconnect
+  this.dbg('channel ready');this.bc('hi',this.helloInfo());
+  if(this.isHost){this.wantFull=true;this.setPhase('live','Hosting room '+this.room+' · live');}
+  else{this.askFull(true);this.setPhase(this.lastStateAt?'live':'waiting',this.lastStateAt?'Live · room '+this.room:'Connected · waiting for the host’s company…');
+   Object.values(this.pend).forEach(a=>{a.sentAt=0;});}},
+ presenceInfo(){return {pid:this.me.id,name:this.me.name,role:(typeof G!=='undefined'&&G&&G.role)||this.me.role,host:this.isHost,page:typeof cur!=='undefined'?cur:'',at:Date.now()};},
+ helloInfo(){return Object.assign(this.presenceInfo(),{t:Date.now()});},
+ see(p){if(!p||!p.pid||(this.me&&p.pid===this.me.id))return;const o=this.seen[p.pid]||{};this.seen[p.pid]=Object.assign(o,{pid:p.pid,name:p.who||p.name||o.name,role:p.role||o.role,host:p.host!==undefined?p.host:o.host,page:p.page||o.page,at:Date.now()});},
+ bc(ev,payload){if(!this.rt||!this.ch)return false;const ok=this.rt.send(this.ch,ev,payload);if(ok){if(ev==='st')this.tx.st++;else if(ev==='act')this.tx.act++;else if(ev==='chat')this.tx.chat++;}return ok;},
+ // ---------- main loop (250 ms) ----------
+ tick(){if(!this.on)return;const now=Date.now();
+  if(this.isHost){if(this.ch&&this.ch.joined){if(this.wantFull&&now-(this.lastFullAt||0)>250){this.sendState(true);}else if(now-(this.lastFullAt||0)>=NT_CFG.fullMs){this.sendState(true);}else if(now-(this.lastDeltaAt||0)>=NT_CFG.deltaMs){this.sendState(false);}}}
+  else{// liveness of the host stream
+   if(this.ch&&this.ch.joined){if(!this.lastStateAt||now-this.lastStateAt>NT_CFG.silentMs){if(this.phase==='live')this.setPhase('waiting','Host is not sending — waiting…');if(now-(this.lastNeedAt||0)>3000)this.askFull(true);}else if(this.phase!=='live')this.setPhase('live','Live · room '+this.room);}
+   // re-send actions the host has not acknowledged
+   Object.values(this.pend).forEach(a=>{if(now-(a.sentAt||0)>=NT_CFG.ackMs){if(a.tries>=20){delete this.pend[a.aid];toast('bad','Action not confirmed','“'+a.label+'” could not be delivered to the host.');return;}a.tries=(a.tries||0)+1;a.sentAt=now;this.bc('act',a);}});
+   // chat: re-send my messages until the host has stored them in the shared log
+   const log=(typeof G!=='undefined'&&G&&G.chatLog)||[];this.localChat.forEach(m=>{if(m.pid!==this.me.id||m.conf)return;if(log.some(x=>x.mid===m.mid)){m.conf=true;return;}if(now-(m.sentAt||m.t)>=NT_CFG.ackMs&&(m.tries||1)<20){m.tries=(m.tries||1)+1;m.sentAt=now;this.bc('chat',m);}});
+   // interpolate the clock between host updates
+   if(typeof G!=='undefined'&&G&&typeof G.hourF==='number'&&this.hostSpeed>0&&this.lastStateAt&&now-this.lastStateAt<NT_CFG.silentMs){const dt=(now-(this._ct||now))/1000;G.hourF=Math.min(23.98,G.hourF+dt*192*this.hostSpeed/3600);if(typeof hudClock==='function')hudClock();}this._ct=now;}
+  // update the header badge with live quality
+  const b=document.getElementById('bOnline');if(b){const r=this.rt&&this.rt.rtt;b.dataset.rtt=r?Math.round(r)+' ms':'';}},
+ askFull(force){const now=Date.now();if(!force&&now-(this.lastNeedAt||0)<1500)return;this.lastNeedAt=now;this.bc('need',{pid:this.me.id,who:this.me.name,role:this.helloInfo().role});},
+ // ---------- state stream ----------
+ SKIP:{opt:1,role:1},
+ ser(){const out={};for(const k in G){if(this.SKIP[k])continue;const v=G[k];if(typeof v==='function')continue;out[k]=JSON.stringify(v,function(kk,x){const raw=this[kk];return raw instanceof Date?{__d:raw.toISOString()}:x;});}return out;},
+ enc(o){const s=JSON.stringify(o);return LZString.compressToBase64(s);},dec(s){return JSON.parse(LZString.decompressFromBase64(s));},
+ sendState(full){const now=Date.now();const all=this.ser();let body;
+  if(full||!this._sent){body=all;full=true;}else{body={};let n=0;for(const k in all)if(this._sent[k]!==all[k]){body[k]=all[k];n++;}for(const k in this._sent)if(!(k in all)){body[k]=null;n++;}if(!n){if(now-(this.lastAnyAt||0)<3000){this.lastDeltaAt=now;return;}body={hourF:all.hourF||'8'};/* keep-alive while paused */}}
+  this._sent=all;const base=this.seq;const seq=++this.seq;const s=this.enc(body);const n=Math.max(1,Math.ceil(s.length/NT_CFG.chunk));const id=this.me.id+':'+seq;
+  for(let i=0;i<n;i++)this.bc('st',{id,i,n,seq,base,kind:full?'full':'delta',s:s.slice(i*NT_CFG.chunk,(i+1)*NT_CFG.chunk),speed:SPEED,ts:now,pid:this.me.id,who:this.me.name,host:true,role:G.role});
+  if(full){this.tx.full++;this.lastFullAt=now;this.wantFull=false;}else this.tx.delta++;this.lastDeltaAt=now;this.lastAnyAt=now;},
+ onState(p){this.rx.st++;this.see(p);if(this.isHost){if(p.pid!==this.me.id&&!this._dupWarned){this._dupWarned=true;toast('warn','Two hosts','Someone else is also hosting room '+this.room+'.');}return;}
+  // messages arrive in order: if a newer message starts while an older one is incomplete, a piece was lost
+  if(!this.chunks[p.id]){for(const k in this.chunks){const o=this.chunks[k];if(o.meta.pid===p.pid&&o.meta.seq<p.seq&&o.got<o.meta.n){delete this.chunks[k];this.rx.gap++;this.dbg('lost part of update '+o.meta.seq+' → asking for a full copy');this.askFull();}}}
+  const c=this.chunks[p.id]||(this.chunks[p.id]={parts:new Array(p.n),got:0,meta:p,at:Date.now()});if(!c.parts[p.i]){c.parts[p.i]=p.s;c.got++;}
+  // drop stale partial messages
+  const now=Date.now();for(const k in this.chunks)if(now-this.chunks[k].at>10000)delete this.chunks[k];
+  if(c.got<p.n)return;delete this.chunks[p.id];const m=c.meta;
+  if(m.kind==='delta'&&m.base!==this.lastSeq){this.rx.gap++;this.dbg('gap: have '+this.lastSeq+', delta needs '+m.base+' → asking for a full copy');this.askFull();return;}
+  if(m.kind==='full'&&this.hostPid&&m.pid===this.hostPid&&m.seq<=this.lastSeq&&m.seq!==0)return;// older duplicate
+  let body;try{body=this.dec(c.parts.join(''));}catch(e){this.dbg('decode failed: '+e.message);this.askFull();return;}
+  try{this.applyState(body,m.kind==='full');}catch(e){this.dbg('apply error: '+e.message);console.warn(e);}this.lastSeq=m.seq;this.hostPid=m.pid;this.hostName=m.who;this.hostSpeed=m.speed||0;this.lastStateAt=Date.now();if(m.kind==='full')this.rx.full++;else this.rx.delta++;
+  if(this.phase!=='live'){const firstTime=!this._gotOnce;this._gotOnce=true;this.setPhase('live','Live · room '+this.room+' · host '+(m.who||''));if(firstTime)toast('good','Connected to '+G.name,'Live from '+(m.who||'the host')+'. Your desk is editable; the rest is live view-only.');}},
+ revive(v){return JSON.parse(v,(k,x)=>x&&typeof x==='object'&&x.__d&&Object.keys(x).length===1?new Date(x.__d):x);},
+ applyState(body,full){const keepRole=G&&G.role,keepOpt=G&&G.opt;const sig=g=>[(g.lines||[]).length,(g.campus||[]).length,(g.net||[]).length,g.hqFloors,g.plantOn,g.site,g.hqSite,JSON.stringify(g.sitesCampus||{}).length,(g.customSites||[]).length].join('|');const before=sig(G);
+  if(full){for(const k of Object.keys(G))if(!this.SKIP[k]&&!(k in body))delete G[k];}
+  for(const k in body){if(body[k]===null)delete G[k];else G[k]=this.revive(body[k]);}
+  G.role=keepRole||G.role;G.opt=keepOpt||G.opt;
+  try{if(typeof ensureOpt==='function')ensureOpt();if(full){if(typeof restoreCustomSites==='function')restoreCustomSites(G);if(typeof registerCustom==='function')registerCustom(G);if(typeof ensureRegions==='function')ensureRegions(G);if(typeof hqLayout==='function')hqLayout(G);}}catch(e){console.warn(e);}
+  // keep the 3D view pointing at the fresh objects
+  try{if(typeof V3!=='undefined'&&V3.R){if(sig(G)!==before)V3.dirty=true;else (V3.R.halls||[]).forEach(h=>{if(h.line&&h.line.id){const l=(G.lines||[]).find(x=>x.id===h.line.id);if(l)h.line=l;}});}}catch(e){}
+  try{if(typeof RB!=='undefined')RB.applyHud();}catch(e){}
+  try{if(full&&!this._renderedFull){this._renderedFull=true;try{buildDock();}catch(e){}render(1);}else render();if(typeof hudClock==='function')hudClock();}catch(e){this.dbg('render after update: '+e.message);}this.renderDrawer();},
+ persist(){if(!this.isHost)return;try{localStorage.setItem('nileRoomState',JSON.stringify({room:this.room,at:Date.now()}));}catch(e){}},
+ // ---------- actions ----------
+ SAFE:/\b(fetch|XMLHttpRequest|import|eval|Function|localStorage|sessionStorage|indexedDB|window|location|cookie|ONLINE|WebSocket|Worker|script|innerHTML|outerHTML|srcdoc)\b/i,
+ MUTATING:/ACT\.|\bG\.|runJobNow|approve\(|convert|dropReq|setPlant|hire\(|placePO|skipMonth|moveDept|startDevelopment|designSku|addMaterial|resolveSituation|ignoreSituation|registerCustom|renameSite|customSite|regDist|regCampaign/,
+ runCode(code,self,reads,record){const ge=document.getElementById.bind(document);const stubEl=v=>({value:v&&v.value!==undefined?v.value:'',checked:!!(v&&v.checked),selectedIndex:v&&v.selectedIndex||0,textContent:'',innerHTML:'',style:{},dataset:{},classList:{add(){},remove(){},toggle(){},contains(){return false;}},select(){},click(){},focus(){},blur(){},querySelector(){return null;},querySelectorAll(){return [];},setAttribute(){},getAttribute(){return null;}});
+  const shim={getElementById:id=>{if(record){const el=ge(id);if(el){if(el.value!==undefined||el.checked!==undefined)reads[id]={value:el.value,checked:el.checked,selectedIndex:el.selectedIndex};return el;}return stubEl();}if(reads&&reads[id])return stubEl(reads[id]);return ge(id)||stubEl();},querySelector:q=>document.querySelector(q)||stubEl(),querySelectorAll:q=>document.querySelectorAll(q),body:document.body,head:document.head,activeElement:document.activeElement,createElement:t=>document.createElement(t)};
+  const evt={stopPropagation(){},preventDefault(){},stopImmediatePropagation(){},target:self,key:''};return new Function('document','event',code).call(self,shim,evt);},
+ selfStub(s){return Object.assign({value:'',checked:false,dataset:{},textContent:'',classList:{add(){},remove(){},toggle(){},contains(){return false;}},parentNode:{querySelectorAll(){return [];},querySelector(){return null;}},nextElementSibling:{textContent:''},style:{}},s||{});},
+ capture(e){if(!this.on)return;const el=e.target&&e.target.closest&&e.target.closest('[onclick],[onchange],[oninput]');if(!el||!el.closest('#work,#v3insp,#modal,#v3bot,#v3top,#hud'))return;const attr=e.type==='click'?'onclick':(el.getAttribute('onchange')?'onchange':'oninput');const code=el.getAttribute(attr)||'';if(!code||!this.MUTATING.test(code))return;
+  const label=(el.tagName==='BUTTON'?el.textContent.trim():((el.previousElementSibling&&el.previousElementSibling.textContent)||el.name||attr)).replace(/\s+/g,' ').slice(0,60);
+  const a={aid:this.me.id+'-'+Date.now().toString(36)+Math.random().toString(36).slice(2,5),pid:this.me.id,who:this.me.name,role:G.role,page:cur,label,code,self:{value:el.value,checked:!!el.checked,dataset:Object.assign({},el.dataset),textContent:el.textContent},reads:{},t:Date.now()};
+  if(this.isHost){this.feed(a);return;}// host: inline handler runs normally
+  e.stopImmediatePropagation();e.preventDefault();
+  try{this.runCode(code,el,a.reads,true);}catch(err){this.dbg('local preview failed: '+err.message);}
+  a.tries=1;a.sentAt=Date.now();this.pend[a.aid]=a;this.bc('act',a);setTimeout(()=>render(1),30);this.renderDrawer();},
+ permitted(a){if(a.role==='admin')return true;const r=(typeof ROLES!=='undefined'?ROLES:[]).find(x=>x.id===a.role);return !a.page||['plant','workflow','situations','options','help','news'].includes(a.page)||(r&&(r.pages||[]).includes(a.page));},
+ onAct(a){if(!this.isHost)return;if(this.done.includes(a.aid)){this.bc('ack',{aid:a.aid,ok:true,dup:true,pid:a.pid});return;}
+  let ok=true,err='';if(this.SAFE.test(a.code)){ok=false;err='unsafe';}else if(!this.permitted(a)){ok=false;err='not your department';}
+  if(ok){try{this.runCode(a.code,this.selfStub(a.self),a.reads||{},false);}catch(e){ok=false;err=e.message;}}
+  this.done.push(a.aid);if(this.done.length>400)this.done.splice(0,100);
+  this.feed(Object.assign({},a,{ok,err}));this.bc('ack',{aid:a.aid,ok,err,pid:a.pid});this.wantFull=true;render(1);},
+ onAck(p){if(this.isHost||!p||!this.pend[p.aid])return;const a=this.pend[p.aid];delete this.pend[p.aid];if(!p.ok)toast('warn','Host refused “'+a.label+'”',p.err||'');this.renderDrawer();},
+ feed(a){if(typeof G==='undefined'||!G)return;G.netFeed=G.netFeed||[];G.netFeed.unshift({who:a.who,role:a.role,page:a.page,label:a.label,ok:a.ok!==false,t:a.t||Date.now()});if(G.netFeed.length>120)G.netFeed.length=120;this.renderDrawer();},
  // ---------- chat ----------
- send(text,to){if(!this.on||!text.trim())return;const m={id:Date.now().toString(36),who:this.me.name,role:G.role,to:to||'all',text:text.trim().slice(0,400),t:Date.now()};this.chat.push(m);this.bc('chat',m);this.renderDrawer();},
- onChat(m){const mine=(ROLES.find(r=>r.id===G.role)||{}).dept;if(m.to!=='all'&&m.to!==mine&&m.to!==G.role&&G.role!=='admin')return;this.chat.push(m);if(this.chat.length>300)this.chat.shift();this.renderDrawer();this.bump();AU.cue('info');},
- bump(){this.unread++;const b=document.getElementById('bOnline');if(b){b.dataset.n=this.unread;b.classList.add('has');}},
- // ---------- self test: proves the realtime path end to end ----------
- async selfTest(){const out=[];const el=document.getElementById('olTest');const show=(running=true)=>{if(el)el.innerHTML=out.map(x=>`<div>${x}</div>`).join('')+(running?'<div class="muted">… testing, please wait for the Result line</div>':'');};const ok=(t)=>{out.push('✅ '+t);show();},bad=(t)=>{out.push('❌ '+t);show(false);};
-  out.push('ℹ️ Build '+NT_BUILD+' · key in use: '+SB_KEY.slice(0,14)+'…');show();
-  // 0. where is the page running?
-  const framed=(()=>{try{return window.top!==window;}catch(e){return true;}})();const here=location.protocol+'//'+location.host;
-  if(framed&&/claude\.ai|anthropic/.test(document.referrer+location.href+(document.location.ancestorOrigins&&[...document.location.ancestorOrigins].join(' ')||'')))bad('You are running inside the claude.ai preview frame — it blocks outside connections (websockets). Download Nile-Tycoon.html and open the file directly, or put it on GitHub Pages, then test again.');else ok('Page origin: '+(location.protocol==='file:'?'local file':here)+(framed?' (in a frame)':''));
-  try{await this.lib();ok('Libraries loaded (supabase-js + lz-string)');}catch(e){bad('Library load failed: '+e.message+' — the page is blocked from cdn.jsdelivr.net / cdnjs');return;}
-  // 1. plain HTTPS reachability + key check
-  try{const r=await fetch(SB_URL+'/rest/v1/',{headers:{apikey:SB_KEY,Authorization:'Bearer '+SB_KEY}});if(r.status===200||r.status===404)ok('HTTPS to the project works, API key accepted ('+r.status+')');else if(r.status===401||r.status===403){let msg='';try{msg=(await r.text()).slice(0,160);}catch(e){}bad('The project rejected the API key ('+r.status+') — server said: '+esc(msg)+' · key in use starts with '+SB_KEY.slice(0,18)+'… If this says "Invalid API key": Supabase → Project Settings → API Keys → Legacy tab → make sure legacy keys are <b>enabled</b> (not disabled) and that the project is not paused.');return;}else bad('HTTPS to the project answered '+r.status);}catch(e){bad('Cannot reach '+SB_URL+' over HTTPS ('+e.message+'). Firewall / network / the page origin blocks it.');return;}
-  // 2. raw websocket handshake (what Realtime needs)
-  const wsr=await new Promise(res=>{let done=false;const fin=v=>{if(!done){done=true;res(v);}};try{const w=new WebSocket(SB_URL.replace('https://','wss://')+'/realtime/v1/websocket?apikey='+encodeURIComponent(SB_KEY)+'&vsn=1.0.0');const to=setTimeout(()=>{fin({ok:false,why:'timeout (no answer in 8 s)'});try{w.close();}catch(e){}},8000);w.onopen=()=>{clearTimeout(to);fin({ok:true});setTimeout(()=>{try{w.close();}catch(e){}},200);};w.onerror=()=>{};w.onclose=ev=>{clearTimeout(to);fin({ok:false,why:'closed code '+ev.code+(ev.reason?' '+ev.reason:'')});};}catch(e){fin({ok:false,why:'blocked: '+e.message});}});
-  if(wsr.ok)ok('Realtime websocket handshake OK');else{bad('Realtime websocket failed — '+wsr.why+'. If HTTPS worked but the websocket does not: (a) you are in a preview frame or a network that blocks wss://, or (b) the Realtime server rejected the key — use the project\'s legacy anon key (Project Settings → API Keys → Legacy) by pasting it below.');}
-
-  try{await this.connect();ok('Client created for '+SB_URL);}catch(e){bad('Client error: '+e.message);return;}
-  const topic='selftest:'+Math.random().toString(36).slice(2,7);const mk=(key)=>this.sb.channel(topic,{config:{broadcast:{self:false,ack:true},presence:{key},private:false}});const ch=mk('a'),ch2=mk('b');let got=false;ch2.on('broadcast',{event:'ping'},()=>{got=true;});
-  const sub=c=>new Promise(res=>{const to=setTimeout(()=>res('TIMEOUT'),10000);c.subscribe((s,e)=>{if(s==='SUBSCRIBED'){clearTimeout(to);res(s);}else if(s==='CHANNEL_ERROR'||s==='TIMED_OUT'){clearTimeout(to);res(s+(e&&e.message?' · '+e.message:''));}});});
-  const st=await sub(ch);const st2=await sub(ch2);
-  if(st!=='SUBSCRIBED'||st2!=='SUBSCRIBED'){bad('Realtime channel: '+(st!=='SUBSCRIBED'?st:st2)+'. Fix: Supabase dashboard → Realtime → Settings → turn ON "Allow public access" (and check nothing blocks wss://'+SB_URL.replace('https://','')+')');try{this.sb.removeChannel(ch);this.sb.removeChannel(ch2);}catch(e){}return;}
-  ok('Realtime websocket connected & two channels subscribed');
-  const r=await ch.send({type:'broadcast',event:'ping',payload:{t:Date.now()}});await new Promise(r=>setTimeout(r,1500));
-  if(got)ok('Broadcast delivered between two connections ('+r+') — messages flow');else bad('Broadcast send returned "'+r+'" but the second connection received nothing — the server is not relaying broadcasts (Realtime settings / quota)');
-  try{await ch.track({t:1});await new Promise(r=>setTimeout(r,800));const n=Object.keys(ch2.presenceState()).length+Object.keys(ch.presenceState()).length;if(n)ok('Presence works');else bad('Presence did not sync');}catch(e){bad('Presence error: '+e.message);}
-  try{this.sb.removeChannel(ch2);}catch(e){}
-  try{this.sb.removeChannel(ch);}catch(e){}out.push('<b>Result:</b> '+(out.some(x=>x.startsWith('❌'))?'something is blocked — see the ❌ line.':'everything works — host & join will stream live.'));show(false);},
- // ---------- drawer UI ----------
- drawerTab:'players',
- toggle(){const d=document.getElementById('olDrawer');d.classList.toggle('on');if(d.classList.contains('on')){this.unread=0;const b=document.getElementById('bOnline');if(b){b.dataset.n='';b.classList.remove('has');}this.renderDrawer();}},
- renderDrawer(){const d=document.getElementById('olDrawer');if(!d||!d.classList.contains('on'))return;const t=this.drawerTab;const roleN=id=>(ROLES.find(r=>r.id===id)||{n:id}).n;const ago=ts=>{const s=Math.round((Date.now()-ts)/1000);return s<60?s+'s':Math.round(s/60)+'m';};
-  const tabs=['players','feed','chat'].map(k=>`<button class="btn sm ${t===k?'p':''}" onclick="ONLINE.drawerTab='${k}';ONLINE.renderDrawer()">${{players:'Players',feed:'Live actions',chat:'Chat'}[k]}</button>`).join('');
-  let body='';
-  if(!this.on)body=`<p class="muted">Not online. Open <b>Options → Online play</b> to host or join a room.</p>`;
-  else if(t==='players'){const ps=Object.values(this.players).sort((a,b)=>(b.host?1:0)-(a.host?1:0));body=`<div class="kv" style="margin-bottom:8px"><span>Room</span><b>${this.room}</b><span>Mode</span><b>${this.host?'host (runs the clock)':'player'}</b></div>`+ps.map(p=>`<div class="it" style="margin-bottom:6px"><span style="font-size:18px">${p.host?'👑':'👤'}</span><span><b>${esc(p.name)}</b> · ${roleN(p.role)}<br><span class="muted" style="font-size:11px">📍 ${p.page||'—'}${p.sel?' · '+esc(p.sel):''} · ${ago(p.at)} ago</span></span></div>`).join('')||'<p class="muted">No one here yet.</p>';}
-  else if(t==='feed'){body=this.feed.map(a=>`<div class="it" style="margin-bottom:4px;align-items:flex-start"><span class="pill" style="min-width:70px;text-align:center">${roleN(a.role)}</span><span><b>${esc(a.who)}</b> ${esc(a.label||'')}${a.page?` <span class="muted" style="font-size:11px">· ${a.page}</span>`:''}<br><span class="muted" style="font-size:11px">${ago(a.t)} ago</span></span></div>`).join('')||'<p class="muted">Actions by every player appear here as they happen.</p>';}
-  else{const mine=(ROLES.find(r=>r.id===G.role)||{}).dept||'all';const depts=['all',...ROLES.filter(r=>r.id!=='admin').map(r=>r.dept)];body=`<div class="feed" id="olChat" style="max-height:48vh;overflow:auto;margin-bottom:8px">${this.chat.map(m=>`<div class="it" style="margin-bottom:4px;align-items:flex-start;${m.who===this.me.name?'background:#e1ecfb':''}"><span class="pill" style="min-width:70px;text-align:center">${roleN(m.role)}</span><span><b>${esc(m.who)}</b>${m.to!=='all'?` <span class="pill info">→ ${esc(m.to)}</span>`:''}<br>${esc(m.text)}<br><span class="muted" style="font-size:11px">${ago(m.t)} ago</span></span></div>`).join('')||'<p class="muted">Say hello to the other departments.</p>'}</div><div class="row" style="gap:6px"><select id="olTo" style="max-width:150px">${depts.map(x=>`<option value="${x}" ${x==='all'?'selected':''}>${x==='all'?'Everyone':x}</option>`).join('')}</select><input id="olMsg" type="text" placeholder="Message…" style="flex:1;min-width:120px" onkeydown="if(event.key==='Enter'){ONLINE.send(this.value,document.getElementById('olTo').value);this.value=''}"><button class="btn sm p" onclick="const i=document.getElementById('olMsg');ONLINE.send(i.value,document.getElementById('olTo').value);i.value=''">Send</button></div>`;}
-  d.innerHTML=`<div class="row" style="justify-content:space-between;margin-bottom:8px"><div class="row" style="gap:6px">${tabs}</div><button class="btn sm" onclick="ONLINE.toggle()">✕</button></div><div class="lbl" style="margin-bottom:6px">${this.on?esc(this.status):'Offline'} · <span id="olConn">${esc(this.chState||'')}</span></div>${body}${this.on?`<details style="margin-top:8px"><summary class="muted" style="font-size:11px;cursor:pointer">Diagnostics · rx state ${this.rx.state} · actions ${this.rx.action} · chat ${this.rx.chat} · presence ${this.rx.presence} · tx state ${this.tx.state} · chat ${this.tx.chat}</summary><div class="mono" style="font-size:10px;max-height:140px;overflow:auto;white-space:pre-wrap">${esc(this.log.join('\n'))}</div></details>`:''}`;const c=document.getElementById('olChat');if(c)c.scrollTop=c.scrollHeight;},
- // ---------- join straight from the intro screen ----------
- async quickJoin(code,name){code=(code||'').trim().toUpperCase();if(!code)return toast('warn','Room code','Enter the 6-letter code the host shared.');if(typeof G==='undefined'||!G){G=newGame({name:'Joining…',ar:'',ceo:'',facilities:[{type:'plant',site:'nubaria'},{type:'hq',site:'cairo'}],cap:1000,col:'#2f7fd6',diff:1,skus:['uht1'],lines:{uht:1}});}AU.init();startApp();await this.join(code,name);},
+ send(text,to){text=(text||'').trim();if(!this.on||!text)return;const m={mid:this.me.id+'-'+Date.now().toString(36)+Math.random().toString(36).slice(2,4),pid:this.me.id,who:this.me.name,role:G.role,to:to||'all',text:text.slice(0,400),t:Date.now(),sentAt:Date.now(),tries:1};this.localChat.push(m);this.bc('chat',m);if(this.isHost)this.storeChat(m);this.renderDrawer();},
+ storeChat(m){G.chatLog=G.chatLog||[];if(!G.chatLog.some(x=>x.mid===m.mid)){G.chatLog.push(m);if(G.chatLog.length>200)G.chatLog.splice(0,G.chatLog.length-200);}},
+ onChat(m){if(this.isHost)this.storeChat(m);const isNew=!this.localChat.some(x=>x.mid===m.mid)&&!((G.chatLog||[]).some(x=>x.mid===m.mid&&!this.isHost));if(isNew&&this.visible(m)){this.bumpIfHidden('chat');try{AU.cue('info');}catch(e){}}if(!this.localChat.some(x=>x.mid===m.mid)){this.localChat.push(m);if(this.localChat.length>300)this.localChat.shift();}this.renderDrawer();},
+ visible(m){const myRole=(typeof G!=='undefined'&&G&&G.role)||this.me.role;const mine=((typeof ROLES!=='undefined'?ROLES:[]).find(r=>r.id===myRole)||{}).dept;return m.to==='all'||m.pid===this.me.id||m.to===mine||m.to===myRole||myRole==='admin';},
+ allChat(){const map={};((typeof G!=='undefined'&&G&&G.chatLog)||[]).concat(this.localChat).forEach(m=>{if(m&&m.mid)map[m.mid]=m;});return Object.values(map).filter(m=>this.visible(m)).sort((a,b)=>a.t-b.t).slice(-150);},
+ players(){const out={};const now=Date.now();Object.values(this.pres).forEach(p=>{out[p.pid]=Object.assign({},p);});Object.values(this.seen).forEach(p=>{if(now-p.at<NT_CFG.helloMs*2.5)out[p.pid]=Object.assign(out[p.pid]||{},p);});if(this.me)out[this.me.id]=Object.assign(this.presenceInfo(),{me:true});return Object.values(out).sort((a,b)=>(b.host?1:0)-(a.host?1:0)||(a.name||'').localeCompare(b.name||''));},
+ bumpIfHidden(tab){const d=document.getElementById('olDrawer');if(d&&d.classList.contains('on')&&this.drawerTab===tab)return;this.unread++;const b=document.getElementById('bOnline');if(b){b.dataset.n=this.unread;b.classList.add('has');}},
+ // ---------- self test (two independent connections) ----------
+ async selfTest(){const out=[];const el=document.getElementById('olTest');const show=(running=true)=>{if(el)el.innerHTML=out.map(x=>`<div>${x}</div>`).join('')+(running?'<div class="muted">… testing, please wait for the Result line</div>':'');};const ok=t=>{out.push('✅ '+t);show();},bad=t=>{out.push('❌ '+t);show(false);};
+  out.push('ℹ️ Build '+NT_BUILD);show();
+  const framed=(()=>{try{return window.top!==window;}catch(e){return true;}})();if(framed&&/claude\.ai|anthropic/.test(document.referrer+location.href))return bad('Running inside the claude.ai preview frame — it blocks outside connections. Open the downloaded file or the GitHub Pages link.');ok('Page origin: '+(location.protocol==='file:'?'local file':location.host));
+  try{await this.lib();ok('Compression library ready');}catch(e){return bad(e.message);}
+  const A=new RT(SB_URL,SB_KEY,()=>{}),B=new RT(SB_URL,SB_KEY,()=>{});const fin=()=>{A.close();B.close();};
+  try{const t0=performance.now();await Promise.race([Promise.all([A.open(),B.open()]),new Promise((_,r)=>setTimeout(()=>r(new Error('timeout')),10000))]);ok('Two realtime connections open ('+Math.round(performance.now()-t0)+' ms)');}catch(e){fin();return bad('Realtime connection failed: '+e.message);}
+  const topic='selftest:'+Math.random().toString(36).slice(2,8);const ca=A.channel(topic,'a'),cb=B.channel(topic,'b');let ab=0,ba=0;A.handle(ca,'ping',()=>ba++);B.handle(cb,'ping',()=>ab++);
+  const sub=(R,c)=>new Promise(res=>{const to=setTimeout(()=>res('timeout'),10000);R.subscribe(c,ev=>{if(ev==='joined'){clearTimeout(to);res('ok');}else if(ev==='refused'){clearTimeout(to);res('refused');}});});
+  const j=await Promise.all([sub(A,ca),sub(B,cb)]);if(j[0]!=='ok'||j[1]!=='ok'){fin();return bad('Channel join '+j.join('/')+' — Supabase → Realtime → Settings → "Allow public access to channels" must be ON.');}ok('Both joined the same room');
+  for(let i=0;i<5;i++){A.send(ca,'ping',{i});B.send(cb,'ping',{i});}await new Promise(r=>setTimeout(r,1500));if(ab===5&&ba===5)ok('Messages both ways: 5/5 and 5/5 delivered');else{fin();return bad('Messages delivered '+ab+'/5 and '+ba+'/5');}
+  const big='x'.repeat(NT_CFG.chunk);let gotBig=false;B.handle(cb,'big',p=>{gotBig=p&&p.s&&p.s.length===big.length;});A.send(ca,'big',{s:big});await new Promise(r=>setTimeout(r,1500));if(gotBig)ok('Large state message ('+Math.round(big.length/1024)+' KB) delivered');else{fin();return bad('Large message not delivered');}
+  A.track(ca,{pid:'a'});B.track(cb,{pid:'b'});let n=0;for(let i=0;i<16&&!n;i++){await new Promise(r=>setTimeout(r,500));n=Object.keys(cb.pres).length;}if(n)ok('Presence (who is online) works');else out.push('⚠️ Presence slow on this server — the game also announces players every 10 s, so the player list still works');
+  const r0=A.refN;const hb=await new Promise(res=>{const ref=A.ref();const t=Date.now();A.hbPending={ref,t};A.raw({topic:'phoenix',event:'heartbeat',payload:{},ref});let k=0;const iv=setInterval(()=>{if(!A.hbPending){clearInterval(iv);res(Date.now()-t);}else if(++k>40){clearInterval(iv);res(-1);}},100);});if(hb>=0)ok('Heartbeat answered in '+hb+' ms');else{fin();return bad('Heartbeat not answered');}
+  fin();out.push('<b>Result:</b> '+(out.some(x=>x.startsWith('❌'))?'blocked — see the ❌ line.':'all good — hosting and joining will stream live.'));show(false);},
+ // ---------- drawer ----------
+ toggle(){const d=document.getElementById('olDrawer');if(!d)return;d.classList.toggle('on');if(d.classList.contains('on')){this.unread=0;const b=document.getElementById('bOnline');if(b){b.dataset.n='';b.classList.remove('has');}this.renderDrawer();}},
+ renderDrawer(){const d=document.getElementById('olDrawer');if(!d||!d.classList.contains('on'))return;const t=this.drawerTab;const roleN=id=>((typeof ROLES!=='undefined'?ROLES:[]).find(r=>r.id===id)||{n:id||'—'}).n;const ago=ts=>{const s=Math.max(0,Math.round((Date.now()-ts)/1000));return s<60?s+'s':Math.round(s/60)+'m';};
+  const dot={live:'#47b36b',connecting:'#f2a93b',reconnecting:'#f2a93b',waiting:'#f2a93b',error:'#e0533f',offline:'#9aa5b1'}[this.phase]||'#9aa5b1';
+  const tabs=[['players','Players'],['feed','Live actions'],['chat','Chat']].map(([k,n])=>`<button class="btn sm ${t===k?'p':''}" onclick="ONLINE.drawerTab='${k}';ONLINE.renderDrawer()">${n}</button>`).join('');let body='';
+  if(!this.on)body=`<p class="muted">Not online. Host from <b>Options → Online play</b>, or join from the start screen with a room code.</p>`;
+  else if(t==='players'){const ps=this.players();body=`<div class="kv" style="margin-bottom:8px"><span>Room</span><b>${esc(this.room)}</b><span>You are</span><b>${this.isHost?'host (runs the clock)':'player'}</b><span>Latency</span><b>${this.rt&&this.rt.rtt?Math.round(this.rt.rtt)+' ms':'—'}</b>${this.isHost?'':`<span>Last update</span><b>${this.lastStateAt?ago(this.lastStateAt)+' ago':'—'}</b>`}</div>`+ps.map(p=>`<div class="it" style="margin-bottom:6px"><span style="font-size:18px">${p.host?'👑':'👤'}</span><span><b>${esc(p.name||'?')}</b>${p.me?' (you)':''} · ${esc(roleN(p.role))}<br><span class="muted" style="font-size:11px">📍 ${esc(p.page||'—')}</span></span></div>`).join('');}
+  else if(t==='feed'){const f=((typeof G!=='undefined'&&G&&G.netFeed)||[]);const pend=Object.values(this.pend);body=(pend.length?`<div class="readonly-note">Sending ${pend.length} action${pend.length>1?'s':''} to the host…</div>`:'')+(f.map(a=>`<div class="it" style="margin-bottom:4px;align-items:flex-start"><span class="pill ${a.ok?'':'bad'}" style="min-width:70px;text-align:center">${esc(roleN(a.role))}</span><span><b>${esc(a.who)}</b> ${esc(a.label||'')}${a.page?` <span class="muted" style="font-size:11px">· ${esc(a.page)}</span>`:''}${a.ok?'':' <span class="pill bad">refused</span>'}<br><span class="muted" style="font-size:11px">${ago(a.t)} ago</span></span></div>`).join('')||'<p class="muted">Every action by every player appears here as it happens.</p>');}
+  else{const depts=['all',...(typeof ROLES!=='undefined'?ROLES:[]).filter(r=>r.id!=='admin').map(r=>r.dept)];const msgs=this.allChat();const prevTo=(document.getElementById('olTo')||{}).value||'all';
+   body=`<div class="feed" id="olChat" style="max-height:46vh;overflow:auto;margin-bottom:8px">${msgs.map(m=>`<div class="it" style="margin-bottom:4px;align-items:flex-start;${m.pid===this.me.id?'background:rgba(47,127,214,.12)':''}"><span class="pill" style="min-width:70px;text-align:center">${esc(roleN(m.role))}</span><span><b>${esc(m.who)}</b>${m.to!=='all'?` <span class="pill info">→ ${esc(m.to)}</span>`:''}<br>${esc(m.text)}<br><span class="muted" style="font-size:11px">${ago(m.t)} ago</span></span></div>`).join('')||'<p class="muted">Say hello to the other departments.</p>'}</div><div class="row" style="gap:6px"><select id="olTo" style="max-width:150px">${depts.map(x=>`<option value="${esc(x)}" ${x===prevTo?'selected':''}>${x==='all'?'Everyone':esc(x)}</option>`).join('')}</select><input id="olMsg" type="text" placeholder="Message…" style="flex:1;min-width:120px" onkeydown="if(event.key==='Enter'){ONLINE.send(this.value,document.getElementById('olTo').value);this.value=''}"><button class="btn sm p" id="olSend" onclick="const i=document.getElementById('olMsg');ONLINE.send(i.value,document.getElementById('olTo').value);i.value='';i.focus()">Send</button></div>`;}
+  // keep a half-typed chat message across re-renders
+  const draft=(document.getElementById('olMsg')||{}).value||'';const focused=document.activeElement&&document.activeElement.id==='olMsg';
+  d.innerHTML=`<div class="row" style="justify-content:space-between;margin-bottom:8px"><div class="row" style="gap:6px">${tabs}</div><button class="btn sm" onclick="ONLINE.toggle()">✕</button></div><div class="lbl" style="margin-bottom:6px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${dot};margin-right:6px"></span>${esc(this.status)}</div>${body}${this.on?`<details style="margin-top:8px"><summary class="muted" style="font-size:11px;cursor:pointer">Diagnostics</summary><div class="mono" style="font-size:10px;white-space:pre-wrap">received: state ${this.rx.st} (full ${this.rx.full}, delta ${this.rx.delta}, gaps ${this.rx.gap}) · actions ${this.rx.act} · acks ${this.rx.ack} · chat ${this.rx.chat}\nsent: state ${this.tx.st} (full ${this.tx.full}, delta ${this.tx.delta}) · actions ${this.tx.act} · chat ${this.tx.chat}\nreconnects ${this.rt?Math.max(0,this.rt.reconnects):0} · rtt ${this.rt&&this.rt.rtt?Math.round(this.rt.rtt)+' ms':'—'}\n${esc(this.log.slice(0,25).join('\n'))}</div><button class="btn sm" style="margin-top:4px" onclick="ONLINE.copyDiag()">Copy diagnostics</button></details>`:''}`;
+  const m2=document.getElementById('olMsg');if(m2){m2.value=draft;if(focused)m2.focus();}const c=document.getElementById('olChat');if(c)c.scrollTop=c.scrollHeight;},
+ copyDiag(){const t=[NT_BUILD,'phase '+this.phase+' · '+this.status,'rx '+JSON.stringify(this.rx),'tx '+JSON.stringify(this.tx),'reconnects '+(this.rt?this.rt.reconnects:0)+' rtt '+(this.rt&&this.rt.rtt),...this.log].join('\n');try{navigator.clipboard.writeText(t);toast('good','Copied','Diagnostics copied.');}catch(e){}},
+ // ---------- join straight from the start screen ----------
+ async quickJoin(code,name){code=(code||'').trim().toUpperCase();if(!code)return toast('warn','Room code','Enter the 6-letter code the host shared.');if(typeof G==='undefined'||!G){G=newGame({name:'Joining…',ar:'',ceo:'',facilities:[{type:'plant',site:'nubaria'},{type:'hq',site:'cairo'}],cap:1000,col:'#2f7fd6',diff:1,skus:['uht1'],lines:{uht:1}});}try{AU.init();}catch(e){}startApp();await this.join(code,name);},
  // ---------- Options panel ----------
- panel(){const c=this.cfg();const name=c.name||'',room=c.room||'';return `<div class="cols"><div class="g panel"><h3>🌐 Online play <span class="pill" style="float:right">${NT_BUILD}</span></h3><p class="help" style="margin-top:0">One browser <b>hosts</b> the company and runs the clock. Everyone else <b>joins</b> with the room code, picks a department (header chip) and acts on their own desk. Everyone sees the same live company, a feed of each other's actions and a department chat (👥 button in the header). Nothing to install or configure.</p>
+ panel(){const c=this.cfg();const name=c.name||'',room=c.room||'';return `<div class="cols"><div class="g panel"><h3>🌐 Online play <span class="pill" style="float:right">${NT_BUILD}</span></h3><p class="help" style="margin-top:0">The <b>host</b> runs the company and the clock. Players <b>join</b> with the room code (start screen → 🌐 Join online, or here), pick a department, act on their own desk and see everything else live. 👥 in the header: players, live actions, chat.</p>
   <div class="ctl" style="margin-bottom:6px"><label style="min-width:110px">Your name</label><input id="olName" type="text" value="${esc(name)}" placeholder="Hossam" style="flex:1;max-width:260px"></div>
-  <div class="ctl" style="margin-bottom:10px"><label style="min-width:110px">Room code</label><input id="olRoom" type="text" value="${esc(room)}" placeholder="leave empty to get a new code" style="flex:1;max-width:260px;text-transform:uppercase"></div>
-  <div class="row" style="gap:6px;flex-wrap:wrap">${this.on?`<button class="btn sm d" onclick="ONLINE.leave()">Leave room</button><span class="pill good" id="olStatus">${esc(this.status)}</span>${this.room?`<button class="btn sm" onclick="navigator.clipboard&&navigator.clipboard.writeText(ONLINE.room);toast('good','Copied','Room code '+ONLINE.room+' copied.')">Copy code ${esc(this.room)}</button>`:''}`:`<button class="btn sm p" onclick="ONLINE.host(document.getElementById('olName').value.trim(),document.getElementById('olRoom').value)">Host this company</button><button class="btn sm" onclick="ONLINE.join(document.getElementById('olRoom').value,document.getElementById('olName').value.trim())">Join room</button><span class="pill" id="olStatus">offline</span>`}</div>
-  <div class="row" style="gap:6px;margin-top:10px;align-items:center"><button class="btn sm" onclick="document.getElementById('olTest').innerHTML='Testing…';ONLINE.selfTest()">Test connection</button><span class="help">20-second check of library, websocket, broadcast and presence.</span></div><div id="olTest" style="font-size:12px;line-height:1.6;margin-top:6px"></div><div class="g" style="padding:10px;margin-top:8px;background:var(--card2)"><div class="lbl">Project API key in use</div><div class="ctl" style="margin-top:4px"><input id="olKey" type="text" style="flex:1;font-family:var(--mono);font-size:11px" value="${esc(SB_KEY)}"><button class="btn sm p" onclick="const v=document.getElementById('olKey').value.trim();if(!v)return;try{localStorage.setItem('nileSbKey',v);}catch(e){}SB_KEY=v;ONLINE.sb=null;toast('good','Key saved','Run Test connection again.');">Use this key</button><button class="btn sm" onclick="try{localStorage.removeItem('nileSbKey');}catch(e){}location.reload()">Reset</button></div><p class="help" style="margin:6px 0 0">If the test says the key is rejected (401): open Supabase → <b>Project Settings → API Keys</b>. Copy the <b>Publishable key</b> again (it must be enabled), or open the <b>Legacy</b> tab and copy the <b>anon</b> key (starts with eyJ…). Paste it here → Use this key → Test connection.</p></div><button class="btn sm" style="margin-top:6px" onclick="const t=(document.getElementById('olTest').innerText||'')+'\n'+ONLINE.log.join('\n')+'\nrx '+JSON.stringify(ONLINE.rx)+' tx '+JSON.stringify(ONLINE.tx)+' state '+(ONLINE.chState||'');navigator.clipboard&&navigator.clipboard.writeText(t);toast('good','Copied','Diagnostics copied — paste them to me if something fails.')">Copy diagnostics</button><p class="help" style="margin-top:10px">If hosting/joining reports <b>CHANNEL_ERROR</b>: in the Supabase dashboard open <b>Realtime → Settings</b> and switch on <b>Allow public access</b> (channels are used without login), then try again. Connection state is shown in the 👥 drawer.</p><p class="help">Host = Administrator (full control, speed buttons). Players' speed controls are disabled. If the host closes the page the game pauses; the host can reopen the file, load the save and host again with the same code — players reconnect with <b>Join room</b>.</p></div>
-  <div class="g panel"><h3>How a session goes</h3><ol style="padding-left:18px;line-height:1.7;margin:0"><li>Host opens the file, sets up or loads the company, logs in as Administrator.</li><li>Host → Options → Online play → name → <b>Host this company</b>; share the 6-letter code.</li><li>Each player opens the same file, starts any company (it is replaced), picks a department on the role screen, then Options → Online play → name + code → <b>Join room</b>.</li><li>Play: your desk is editable, every other page is live view-only; 👥 shows who is online, every action as it happens, and the chat (to everyone or one department).</li></ol></div></div>`;},
+  <div class="ctl" style="margin-bottom:10px"><label style="min-width:110px">Room code</label><input id="olRoom" type="text" value="${esc(room)}" placeholder="empty = new code" style="flex:1;max-width:260px;text-transform:uppercase"></div>
+  <div class="row" style="gap:6px;flex-wrap:wrap;align-items:center">${this.on?`<button class="btn sm d" onclick="ONLINE.leave()">Leave room</button><span class="pill" id="olStatus">${esc(this.status)}</span><button class="btn sm" onclick="navigator.clipboard&&navigator.clipboard.writeText(ONLINE.room);toast('good','Copied','Room code '+ONLINE.room)">Copy code ${esc(this.room)}</button>`:`<button class="btn sm p" onclick="ONLINE.host(document.getElementById('olName').value.trim(),document.getElementById('olRoom').value)">Host this company</button><button class="btn sm" onclick="ONLINE.join(document.getElementById('olRoom').value,document.getElementById('olName').value.trim())">Join room</button><span class="pill" id="olStatus">offline</span>`}</div>
+  <div class="row" style="gap:6px;margin-top:12px;align-items:center"><button class="btn sm" onclick="document.getElementById('olTest').innerHTML='Testing…';ONLINE.selfTest()">Test connection</button><span class="help">Checks connection, messages both ways, large messages, presence and heartbeat.</span></div><div id="olTest" style="font-size:12px;line-height:1.6;margin-top:6px"></div></div>
+  <div class="g panel"><h3>How it stays live</h3><ul style="padding-left:18px;line-height:1.7;margin:0"><li>Changes stream every second; a full copy every 15 s and right after every action.</li><li>A player who misses an update asks for a full copy automatically.</li><li>Actions are re-sent until the host confirms them, and applied exactly once.</li><li>Dropped connections are detected by heartbeat and re-joined automatically (works in background tabs).</li><li>Chat and the action feed are stored in the shared company, so late joiners see the history.</li></ul></div></div>`;}
 };
-// ---------- wiring ----------
+/* ---------- wiring ---------- */
 (function(){
- // capture clicks / changes before inline handlers run
  document.addEventListener('click',e=>ONLINE.capture(e),true);document.addEventListener('change',e=>ONLINE.capture(e),true);
- // players never run the clock; their speed buttons are disabled
- const ss=setSpeed;setSpeed=function(s,silent){if(ONLINE.on&&!ONLINE.host&&s>0){toast('info','Host controls the clock','Only the host changes the speed.');s=0;}ss(s,silent);document.querySelectorAll('.speed button,#bSkip').forEach(b=>b.disabled=ONLINE.on&&!ONLINE.host);};
- // HUD button + drawer
- const addUi=()=>{if(document.getElementById('bOnline'))return;const bell=document.getElementById('bBell');if(!bell)return;const b=document.createElement('button');b.className='ib';b.id='bOnline';b.title='Players, live actions & chat';b.textContent='👥';b.dataset.n='';b.onclick=()=>ONLINE.toggle();bell.after(b);const d=document.createElement('div');d.id='olDrawer';d.className='g';document.body.appendChild(d);const st=document.createElement('style');st.textContent='#olDrawer{position:fixed;right:max(12px,var(--sar));top:calc(var(--sat) + 112px);width:min(380px,calc(100vw - 24px));max-height:calc(100vh - 200px);overflow:auto;padding:12px;z-index:62;display:none}#olDrawer.on{display:block}#bOnline.on{box-shadow:inset 0 0 0 2px #47b36b}#bOnline.has::after{content:attr(data-n);position:absolute;top:-6px;right:-6px;background:#e0533f;color:#fff;border-radius:10px;font-size:10px;padding:1px 5px}#bOnline{position:relative}html.lang-ar #olDrawer{right:auto;left:max(12px,var(--sal))}';document.head.appendChild(st);};
+ const ss=setSpeed;setSpeed=function(s,silent){if(ONLINE.on&&!ONLINE.isHost&&s>0){if(!silent)toast('info','Host controls the clock','Only the host changes the speed.');s=0;}ss(s,silent);document.querySelectorAll('.speed button,#bSkip').forEach(b=>b.disabled=ONLINE.on&&!ONLINE.isHost);};
+ // players never advance time themselves
+ const tk=tick;tick=function(g){if(ONLINE.on&&!ONLINE.isHost)return;return tk(g);};
+ const sm=skipMonth;skipMonth=function(){if(ONLINE.on&&!ONLINE.isHost){toast('info','Host controls the clock','Only the host can skip time.');return;}return sm.apply(this,arguments);};
+ const wake=()=>{if(ONLINE.on&&ONLINE.rt)ONLINE.rt.nudge();};document.addEventListener('visibilitychange',()=>{if(!document.hidden)wake();});window.addEventListener('online',wake);window.addEventListener('focus',wake);
+ window.addEventListener('pagehide',()=>{if(ONLINE.on&&ONLINE.rt&&ONLINE.ch)ONLINE.rt.send(ONLINE.ch,'bye',{pid:ONLINE.me.id,host:ONLINE.isHost});});
+ const addUi=()=>{if(document.getElementById('bOnline'))return;const bell=document.getElementById('bBell');if(!bell)return;const b=document.createElement('button');b.className='ib';b.id='bOnline';b.title='Players, live actions & chat';b.textContent='👥';b.dataset.n='';b.dataset.phase='offline';b.onclick=()=>ONLINE.toggle();bell.after(b);const d=document.createElement('div');d.id='olDrawer';d.className='g';document.body.appendChild(d);
+  const st=document.createElement('style');st.textContent='#olDrawer{position:fixed;right:max(12px,var(--sar));top:calc(var(--sat) + 112px);width:min(390px,calc(100vw - 24px));max-height:calc(100vh - 190px);overflow:auto;padding:12px;z-index:62;display:none}#olDrawer.on{display:block}#bOnline{position:relative}#bOnline::before{content:"";position:absolute;left:3px;bottom:3px;width:8px;height:8px;border-radius:50%;background:#9aa5b1;box-shadow:0 0 0 2px #fff}#bOnline[data-phase=live]::before{background:#47b36b}#bOnline[data-phase=connecting]::before,#bOnline[data-phase=reconnecting]::before,#bOnline[data-phase=waiting]::before{background:#f2a93b}#bOnline[data-phase=error]::before{background:#e0533f}#bOnline.has::after{content:attr(data-n);position:absolute;top:-6px;right:-6px;background:#e0533f;color:#fff;border-radius:10px;font-size:10px;padding:1px 5px}html.lang-ar #olDrawer{right:auto;left:max(12px,var(--sal))}';document.head.appendChild(st);};
  const sa=startApp;startApp=function(){sa();if(typeof G.hourF!=='number')G.hourF=8;addUi();const bt=document.getElementById('buildTag');if(bt)bt.textContent=NT_BUILD;};
  const bj=document.getElementById('bJoin');if(bj)bj.onclick=()=>ONLINE.quickJoin(document.getElementById('iJoinCode').value,document.getElementById('iJoinName').value.trim());
- // presence: refresh page on navigation
- const g0=go;go=function(id){g0(id);if(ONLINE.on&&ONLINE.ch)ONLINE.ch.track(ONLINE.track());};
+ const g0=go;go=function(id){g0(id);if(ONLINE.on&&ONLINE.rt&&ONLINE.ch)ONLINE.rt.track(ONLINE.ch,ONLINE.presenceInfo());};
 })();
 </script>
 
